@@ -373,12 +373,13 @@ LOCAL_SAMPLES
 HISAT2_SAMPLE_COMPLETE_SIGNAL = Channel.create()
 KALLISTO_SAMPLE_COMPLETE_SIGNAL = Channel.create()
 SALMON_SAMPLE_COMPLETE_SIGNAL = Channel.create()
+FAILED_SAMPLE_SIGNAL = Channel.create()
 
 // Create the channel that will collate all the signals
 // and release a signal when the sample is complete
 SAMPLE_COMPLETE_SIGNAL = Channel.create()
 SAMPLE_COMPLETE_SIGNAL
-  .mix(HISAT2_SAMPLE_COMPLETE_SIGNAL, KALLISTO_SAMPLE_COMPLETE_SIGNAL, SALMON_SAMPLE_COMPLETE_SIGNAL)
+  .mix(HISAT2_SAMPLE_COMPLETE_SIGNAL, KALLISTO_SAMPLE_COMPLETE_SIGNAL, SALMON_SAMPLE_COMPLETE_SIGNAL, FAILED_SAMPLE_SIGNAL)
   .into { NEXT_SAMPLE_SIGNAL; MULTIQC_READY_SIGNAL; CREATE_GEM_READY_SIGNAL }
 
 
@@ -403,6 +404,8 @@ process next_sample {
     success = false
 
     try {
+      // Lets create a lock file so we don't have a race condition when
+      // moving files into the process directory.
       attempts = 0
       while (!lock)  {
         if (attempts < 3) {
@@ -424,8 +427,13 @@ process next_sample {
           throw new Exception("Cannot obtain lock to proceed to next sample after 3 attempts")
         }
       }
+
+      // Move the current sample into the 'done' directory.  However, if the sample
+      // failed it would have been moved out already so only move if the file is found.
       sample_file = file("${workflow.workDir}/GEMmaker/process/" + sample_id + '.sample.csv')
-      sample_file.moveTo("${workflow.workDir}/GEMmaker/done")
+      if (sample_file) {
+        sample_file.moveTo("${workflow.workDir}/GEMmaker/done")
+      }
 
       // Move the next sample file into the processing directory
       // which will trigger the start of the next sample.
@@ -520,16 +528,43 @@ process prefetch {
   output:
     set val(sample_id), file("*.sra") into SRA_TO_EXTRACT_PREFETCH
     set val(sample_id), file("*.sra") into SRA_TO_CLEAN_PREFETCH
+    set val(sample_id), file("*.failed") optional true into SRA_PREFETCH_FAILED
 
   script:
   """
+  exit=0
   ids=`echo $run_ids | perl -p -e 's/[\\[,\\]]//g'`
   for run_id in \$ids; do
-    prefetch --output-directory . \$run_id
+    prefetch --output-directory . \$run_id --max-size 50G > \$run_id.log 2>&1
+    exit=\$?
+    not_found=`grep "item not found2" \$run_id.log | wc -l`
+    if [ \$not_found == 1 ]; then
+      touch ${sample_id}.failed
+      exit=0
+    fi
   done
+  (exit \$exit)
   """
 }
 
+/**
+ * Moves a failed sample into the work/GEMmaker/failed folder
+ */
+process failed_sample {
+  tag { sample_id }
+
+  input:
+    set val(sample_id), file("*.failed") from SRA_PREFETCH_FAILED
+
+  output:
+    val sample_id into FAILED_SAMPLE_SIGNAL
+
+  exec:
+    sample_file = file("${workflow.workDir}/GEMmaker/process/" + sample_id + '.sample.csv')
+    sample_file.moveTo("${workflow.workDir}/GEMmaker/failed")
+
+
+}
 
 
 /**
